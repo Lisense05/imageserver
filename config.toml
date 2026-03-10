@@ -13,3 +13,10 @@ ip = "127.0.0.1"
 max_image_size = 10240
 # the max iamge size to allow in kilobytes
 max_audio_size = 20480
+# fixed API key used for request authentication
+api_key = "change-me"
+# upload rate limit per IP in each time window
+rate_limit_max_requests = 60
+# length of the upload rate limit window in seconds
+rate_limit_window_seconds = 60
+

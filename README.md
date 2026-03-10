@@ -19,3 +19,15 @@ Uploads an image
 
 https://localhost/v1/images
 
+## Authentication
+
+Image and audio uploads now require an `Authorization` request header with the same value as `api_key` in `config.toml`. Requests with a missing or invalid header return `401` immediately, before multipart body parsing.
+
+Example request setup for `POST /v1/image`:
+- Header: `Authorization: change-me`
+- Body: `form-data` with a file field (for example `file`)
+
+## Rate limiting
+
+Upload endpoints are rate-limited per client IP using `rate_limit_max_requests` and `rate_limit_window_seconds` from `config.toml`. When the limit is exceeded, the server returns `429`.
+

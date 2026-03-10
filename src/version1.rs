@@ -1,18 +1,19 @@
-use actix_web::error::ErrorInternalServerError;
+use actix_web::error::{ErrorInternalServerError, ErrorTooManyRequests, ErrorUnauthorized};
 use actix_web::http::header::{CacheControl, CacheDirective, ContentType};
-use actix_web::{error::ErrorBadRequest, get, web, Error, HttpResponse};
+use actix_web::{error::ErrorBadRequest, get, web, Error, HttpRequest, HttpResponse};
 
 use actix_multipart::Multipart;
 use futures_util::stream::StreamExt as _;
 
 use std::fs;
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Config;
+use crate::{AppState, Config, RateLimitState};
 
 #[derive(Deserialize)]
 struct Url {
@@ -76,20 +77,85 @@ struct AudioReturnData {
     url: String,
 }
 
-pub async fn upload_image(
-    mut payload: Multipart,
-    config: web::Data<Config>,
-) -> Result<HttpResponse, Error> {
+fn check_rate_limit(
+    request: &HttpRequest,
+    config: &Config,
+    app_state: &AppState,
+) -> Result<(), Error> {
+    let rate_limit_key = request
+        .connection_info()
+        .realip_remote_addr()
+        .map(str::to_string)
+        .or_else(|| request.peer_addr().map(|addr| addr.ip().to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let now = Instant::now();
+    let window = Duration::from_secs(config.rate_limit_window_seconds);
+
+    let mut limiter_map = app_state
+        .upload_rate_limit_map
+        .lock()
+        .map_err(|_| ErrorInternalServerError("Failed to access rate limiter."))?;
+
+    let limiter_entry = limiter_map
+        .entry(rate_limit_key)
+        .or_insert_with(|| RateLimitState {
+            request_count: 0,
+            window_started_at: now,
+        });
+
+    if now.duration_since(limiter_entry.window_started_at) >= window {
+        limiter_entry.request_count = 0;
+        limiter_entry.window_started_at = now;
+    }
+
+    if limiter_entry.request_count >= config.rate_limit_max_requests {
+        return Err(ErrorTooManyRequests("Too many upload requests."));
+    }
+
+    limiter_entry.request_count += 1;
+
+    Ok(())
+}
+
+fn check_authorization_header(request: &HttpRequest, config: &Config) -> Result<(), Error> {
+    let authorization_header = request
+        .headers()
+        .get("Authorization")
+        .ok_or_else(|| ErrorUnauthorized("Missing Authorization header."))?
+        .to_str()
+        .map_err(|_| ErrorUnauthorized("Invalid Authorization header."))?;
+
+    if authorization_header.trim() != config.api_key {
+        return Err(ErrorUnauthorized("Invalid Authorization header."));
+    }
+
+    Ok(())
+}
+
+async fn read_multipart_binary(mut payload: Multipart) -> Result<Vec<u8>, Error> {
     let mut data = Vec::new();
 
     while let Some(item) = payload.next().await {
         let mut field = item?;
         while let Some(chunk) = field.next().await {
-            for byte in chunk?.to_vec() {
-                data.push(byte);
-            }
+            data.extend_from_slice(&chunk?);
         }
     }
+
+    Ok(data)
+}
+
+pub async fn upload_image(
+    request: HttpRequest,
+    payload: Multipart,
+    config: web::Data<Config>,
+    app_state: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    check_rate_limit(&request, &config, &app_state)?;
+    check_authorization_header(&request, &config)?;
+
+    let data = read_multipart_binary(payload).await?;
 
     if !infer::is_image(&data) {
         return Err(ErrorBadRequest("The provided data wasn't an image."));
@@ -130,19 +196,15 @@ pub async fn fetch_image(image_name: web::Path<String>) -> Result<HttpResponse, 
 
 // TODO: Turn this stuff into a trait to de-duplicate
 pub async fn upload_audio(
-    mut payload: Multipart,
+    request: HttpRequest,
+    payload: Multipart,
     config: web::Data<Config>,
+    app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    let mut data = Vec::new();
+    check_rate_limit(&request, &config, &app_state)?;
+    check_authorization_header(&request, &config)?;
 
-    while let Some(item) = payload.next().await {
-        let mut field = item?;
-        while let Some(chunk) = field.next().await {
-            for byte in chunk?.to_vec() {
-                data.push(byte);
-            }
-        }
-    }
+    let data = read_multipart_binary(payload).await?;
 
     let kind = infer::get(&data).unwrap();
     if kind.mime_type() != "video/webm" {
@@ -158,9 +220,9 @@ pub async fn upload_audio(
             file.write_all(&data).unwrap();
             let return_data = serde_json::to_string(&AudioReturnData {
                 url: format!(
-                          "{}://{}/v1/audio/{}",
-                          config.protocol, config.domain, audio_url
-                          ),
+                    "{}://{}/v1/audio/{}",
+                    config.protocol, config.domain, audio_url
+                ),
             })
             .unwrap();
 

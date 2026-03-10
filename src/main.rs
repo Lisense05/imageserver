@@ -1,6 +1,6 @@
 use actix_web::{error, web, App, HttpResponse, HttpServer};
 
-use std::{fs, io::Read};
+use std::{collections::HashMap, fs, io::Read, sync::Mutex, time::Instant};
 
 use serde::Deserialize;
 
@@ -14,6 +14,18 @@ pub struct Config {
     port: u16,
     max_image_size: usize,
     max_audio_size: usize,
+    api_key: String,
+    rate_limit_max_requests: u32,
+    rate_limit_window_seconds: u64,
+}
+
+pub struct RateLimitState {
+    pub request_count: u32,
+    pub window_started_at: Instant,
+}
+
+pub struct AppState {
+    pub upload_rate_limit_map: Mutex<HashMap<String, RateLimitState>>,
 }
 
 #[actix_web::main]
@@ -75,22 +87,27 @@ async fn main() -> std::io::Result<()> {
                 error::InternalError::from_response(err, HttpResponse::Conflict().finish()).into()
             });
 
-        App::new().app_data(config_clone).service(
-            web::scope("/v1")
-                .service(version1::embed_external)
-                .service(
-                    web::scope("/image")
-                        .app_data(image_config)
-                        .route("", web::post().to(version1::upload_image))
-                        .route("/{image_name}", web::get().to(version1::fetch_image)),
-                )
-                .service(
-                    web::scope("/audio")
-                        .app_data(audio_config)
-                        .route("", web::post().to(version1::upload_audio))
-                        .route("/{audio_name}", web::get().to(version1::fetch_audio)),
-                ),
-        )
+        App::new()
+            .app_data(config_clone)
+            .app_data(web::Data::new(AppState {
+                upload_rate_limit_map: Mutex::new(HashMap::new()),
+            }))
+            .service(
+                web::scope("/v1")
+                    .service(version1::embed_external)
+                    .service(
+                        web::scope("/image")
+                            .app_data(image_config)
+                            .route("", web::post().to(version1::upload_image))
+                            .route("/{image_name}", web::get().to(version1::fetch_image)),
+                    )
+                    .service(
+                        web::scope("/audio")
+                            .app_data(audio_config)
+                            .route("", web::post().to(version1::upload_audio))
+                            .route("/{audio_name}", web::get().to(version1::fetch_audio)),
+                    ),
+            )
     })
     .bind((config.ip, config.port))?
     .run()
